@@ -11,6 +11,7 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { renderLintReport } from "./report.mjs";
+import { resolveFfmpeg, resolveFfprobe } from "../../media-bin/src/index.mjs";
 
 const VERSION = 1;
 const EPSILON = 1e-6;
@@ -59,7 +60,7 @@ export async function runCli(argv, io = console) {
 }
 
 export async function lintProject(input, options = {}) {
-  const paths = await resolveInput(input);
+  const paths = await resolveInput(input, options);
   const findings = [];
   const skipped = [];
   const inputs = {};
@@ -342,7 +343,7 @@ export function parseArguments(argv) {
   return { input, ...options };
 }
 
-async function resolveInput(input) {
+async function resolveInput(input, options = {}) {
   const absolute = resolve(input);
   let inputStats;
   try {
@@ -351,8 +352,12 @@ async function resolveInput(input) {
     throw new ExecutionError(`Input cannot be read: ${messageOf(error)}`);
   }
 
-  const editPath = inputStats.isDirectory() ? join(absolute, "edit.json") : absolute;
-  if (!inputStats.isDirectory() && basename(absolute) !== "edit.json") {
+  const editPath = options.editPath
+    ? resolve(options.editPath)
+    : inputStats.isDirectory()
+      ? join(absolute, "edit.json")
+      : absolute;
+  if (!options.editPath && !inputStats.isDirectory() && basename(absolute) !== "edit.json") {
     throw new ExecutionError("Input file must be named edit.json");
   }
   const projectRoot = dirname(editPath);
@@ -2803,7 +2808,7 @@ function isIsoDateTime(value) {
 }
 
 function runMediaChecks(sourcePath, findings, paths, options, captions) {
-  const command = options.ffmpegCommand ?? process.env.FFMPEG ?? "ffmpeg";
+  const command = options.ffmpegCommand ?? process.env.FFMPEG ?? resolveFfmpeg();
   const sourceRelative = relativePath(paths.projectRoot, sourcePath);
   const silence = runCommand(command, [
     "-hide_banner",
@@ -2910,7 +2915,7 @@ function runMediaChecks(sourcePath, findings, paths, options, captions) {
 }
 
 function probeDuration(sourcePath, configuredCommand) {
-  const command = configuredCommand ?? process.env.FFPROBE ?? "ffprobe";
+  const command = configuredCommand ?? process.env.FFPROBE ?? resolveFfprobe();
   const result = runCommand(command, [
     "-v",
     "error",

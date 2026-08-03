@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { chmod, copyFile, cp, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,6 +33,13 @@ await cp(overlayRuntimeSource, overlayRuntimeDestination, { recursive: true });
 await copyFile(
   path.join(repoRoot, 'packages', 'overlay-runtime', 'package.json'),
   path.join(overlayRuntimeDestination, 'package.json')
+);
+// 共有カーネルの webview 用 IIFE バンドル（edit-store の build が生成・lib/ にコミット済み）。
+// akari-preview-service の findWebviewKernelBundle() が packaged では
+// lib/overlay-runtime/webview-kernel.js を最初に探す。
+await copyFile(
+  path.join(repoRoot, 'packages', 'edit-store', 'lib', 'webview-kernel.js'),
+  path.join(overlayRuntimeDestination, 'webview-kernel.js')
 );
 console.log(`Copied overlay-runtime assets to ${path.relative(shellRoot, overlayRuntimeDestination)}`);
 
@@ -85,14 +93,14 @@ console.log(`Copied project-default template to ${path.relative(shellRoot, proje
 //   存在しない（darwin だけの構成）。追加コピーは不要。
 if (targetPlatform === 'darwin') {
   const platformArch = `${targetPlatform}-${targetArch}`;
-  const source = path.join(
-    shellRoot,
-    'node_modules',
-    'node-pty',
-    'prebuilds',
-    platformArch,
-    'spawn-helper'
-  );
+  // node-pty は npm workspaces の hoisting 次第で apps/shell 配下にもリポ直下にも
+  // 置かれうる（lockfile の dedupe 結果で揺れる）。実在する方を使う。
+  const source = [shellRoot, repoRoot]
+    .map(root => path.join(root, 'node_modules', 'node-pty', 'prebuilds', platformArch, 'spawn-helper'))
+    .find(candidate => existsSync(candidate));
+  if (!source) {
+    throw new Error(`node-pty spawn-helper (${platformArch}) が apps/shell とリポ直下のどちらの node_modules にも見つかりません`);
+  }
   const destination = path.join(
     shellRoot,
     'lib',

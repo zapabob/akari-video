@@ -7,6 +7,10 @@ export interface OverlayRuntimeAssets {
     runtimeJavaScript: string;
     interactionJavaScript: string;
     interactionCss: string;
+    // 共有カーネル（packages/edit-store/src/webview-kernel.ts — timeline-map 等）。
+    // webview は sandbox 制約で import できないため、IIFE バンドル
+    // （edit-store lib/webview-kernel.js、global: AkariEditKernel）をインライン注入する。
+    webviewKernelJavaScript: string;
     // win2-fonts-wire: render-cut の焼き込みキャプション（packages/render-cut/src/captions.mjs）と
     // 同じ Noto Sans JP を字幕表示に固定するための @font-face src。prepareHtml() の webview は
     // file:// を同一オリジンで読めない（render-cut の rasterize.mjs は Puppeteer が file:// ページを
@@ -141,6 +145,10 @@ export type ResolveHevcProxyResult =
 // packages/edit-lint（呼び出しのみ・改変禁止）で検証する。プロジェクトルートの兄弟ファイル
 // （source 動画・captions.json 等）はシンボリックリンクで一時ディレクトリへ写し、参照整合チェックが
 // 誤検出しないようにする。
+/**
+ * 書き込み前 lint ゲートの検証依頼。editUri は対象ファイルの URI — edit.json のほか
+ * captions.json も渡せる（URI の basename がそのまま lint 候補のファイル名になる）。
+ */
 export interface LintEditCandidateRequest {
     editUri: string;
     candidateText: string;

@@ -8,6 +8,12 @@
 /electron-builder-out/
 /*.app/
 
+# generated third-party license notices (prepackage で毎回再生成)
+/resources/generated-notices/
+
+# bundled ffmpeg/ffprobe binaries (prepackage で毎回再生成。task/2026-07-31-shell-ffmpeg-bundle)
+/resources/vendor-ffmpeg/
+
 # dependencies
 /node_modules/
 /extensions/*/node_modules/

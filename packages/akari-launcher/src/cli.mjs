@@ -1,12 +1,14 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 
-import { createProject } from '../../project-scaffold/src/index.mjs';
-import { resolveRepoAssets } from './repo-assets.mjs';
+import { resolveLauncherAssets } from './repo-assets.mjs';
 import { detectProjectState } from './project-state.mjs';
-import { findClaudeExecutable } from './path-lookup.mjs';
+import { findClaudeExecutable, findOpencodeExecutable } from './path-lookup.mjs';
 import { loadTaskLabels } from './task-labels.mjs';
-import { describeIntake, claudeMissingGuidance, describeUpdateCommand, describeVersionStatus, formatUpdateNotice } from './messages.mjs';
+import { describeIntake, claudeMissingGuidance, opencodeMissingGuidance, describeUpdateCommand, describeVersionStatus, formatUpdateNotice } from './messages.mjs';
+import { resolveEffectiveProjectRoot } from './first-run.mjs';
+import { maybeSetupSounds } from './sounds-setup.mjs';
 import {
   checkForUpdateSync,
   readCacheSync,
@@ -19,27 +21,48 @@ import {
 /**
  * `akari` ランチャーの本体。3 入口契約（ターミナル `akari` / セッション内 `/akari` /
  * アプリ接続ボタン）のうち、ターミナル入口を実装する:
- *   doctor（接続チェック）→ 未セットアップなら案内 + scaffold → 最後に `claude` を exec。
+ *   作業場（creator-root）の初回動線（`first-run.mjs`）→ doctor（接続チェック）→
+ *   未セットアップなら案内 + scaffold → 最後に `claude` を exec。
  *
- * すべての副作用（scaffold・doctor 実行・claude 起動・claude 探索）は options 経由で
- * 差し替え可能にしてあり、node --test から実プロセスを起動せずに分岐を検証できる。
+ * すべての副作用（creator-root 解決・scaffold・doctor 実行・claude 起動・claude 探索）は
+ * options 経由で差し替え可能にしてあり、node --test から実プロセスを起動せずに分岐を検証できる。
  */
 export async function run(args, options = {}) {
-  const projectRoot = options.projectRoot ?? process.cwd();
   const log = options.log ?? ((line) => console.log(line));
-  const assets = options.assets ?? resolveRepoAssets();
+  const assets = options.assets ?? resolveLauncherAssets();
   const scaffold = options.scaffold ?? defaultScaffold;
   const runDoctor = options.runDoctor ?? defaultRunDoctor;
   const resolveClaude = options.resolveClaude ?? (() => findClaudeExecutable());
+  const resolveOpencode = options.resolveOpencode ?? (() => findOpencodeExecutable());
   const spawnClaude = options.spawnClaude ?? defaultSpawnClaude;
+  const spawnOpencode = options.spawnOpencode ?? defaultSpawnOpencode;
   const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
   const currentVersion = options.currentVersion ?? readOwnVersion();
+  const now = options.now ?? new Date();
+
+  // --opencode / --claude / --claudecode / --yes / --here フラグを解析
+  const useOpencode = args.includes('--opencode');
+  const autoConfirm = args.includes('--yes') || args.includes('-y');
+  const hereOnly = args.includes('--here');
+  const filteredArgs = args.filter(arg =>
+    arg !== '--opencode' && arg !== '--claude' && arg !== '--claudecode'
+    && arg !== '--yes' && arg !== '-y' && arg !== '--here'
+  );
+
+  let projectRoot = options.projectRoot ?? process.cwd();
+
+  // 作業場（creator-root）の初回動線（契約 §5・§6-1）。`--here` はお試しモード強制
+  // （現行動作）のため丸ごとスキップする（契約 §9・非 TTY と同じ現行動作互換の扱い）。
+  if (!hereOnly) {
+    projectRoot = await resolveEffectiveProjectRoot({ projectRoot, env, platform, now, log, assets, autoConfirm, options });
+  }
 
   let state = detectProjectState(projectRoot);
 
   if (!state.scaffolded) {
     log(`このフォルダーは AKARI Video プロジェクトとしてまだセットアップされていません: ${projectRoot}`);
-    if (!assets.templateDir) {
+    if (!assets.templateDir || !assets.scaffoldModulePath) {
       log('プロジェクト雛形が見つからないため、雛形の作成をスキップしました。');
     } else {
       log('プロジェクトの雛形を作成します…');
@@ -78,19 +101,60 @@ export async function run(args, options = {}) {
   }
   (options.refreshUpdate ?? triggerBackgroundRefresh)({ env });
 
-  log('Claude Code を起動します…');
-  const claudePath = resolveClaude();
-  if (!claudePath) {
-    log(claudeMissingGuidance());
-    return { exitCode: 1, scaffolded: state.scaffolded, claudeLaunched: false };
+  // 公式音源ライブラリ（AKARI Sounds）の初回セットアップ（質問は生涯 1 回・既定 Yes）。
+  // 導入済み / 過去に n / 非 TTY / スクリプト未同梱では何も表示しない。
+  // どんな失敗でも claude 起動までは止めない（「最後に claude を exec」は不変条件）。
+  try {
+    await (options.setupSounds ?? maybeSetupSounds)({
+      env, log, assets, autoConfirm,
+      // isTTY / prompt は first-run（creator-root プロンプト）と同じトップレベル注入を引き継ぐ
+      // （prompt を引き継がないと、isTTY 注入 + 非対話 stdin の組み合わせで実 stdin 待ちになる）
+      options: { isTTY: options.isTTY, prompt: options.prompt, ...(options.soundsOptions ?? {}) }
+    });
+  } catch (error) {
+    log(`音源セットアップでエラーが発生しました（続行します）: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const result = spawnClaude(claudePath, args, projectRoot);
-  const exitCode = typeof result.status === 'number' ? result.status : (result.error ? 1 : 0);
-  return { exitCode, scaffolded: state.scaffolded, claudeLaunched: true };
+  if (useOpencode) {
+    log('opencode を起動します…');
+    const opencodePath = resolveOpencode();
+    if (!opencodePath) {
+      log(opencodeMissingGuidance());
+      return { exitCode: 1, scaffolded: state.scaffolded, opencodeLaunched: false };
+    }
+
+    const opencodeArgs = autoConfirm ? ['--auto', ...filteredArgs] : filteredArgs;
+    const result = spawnOpencode(opencodePath, opencodeArgs, projectRoot);
+    const exitCode = typeof result.status === 'number' ? result.status : (result.error ? 1 : 0);
+    return { exitCode, scaffolded: state.scaffolded, opencodeLaunched: true };
+  } else {
+    const claudePath = resolveClaude();
+    if (claudePath) {
+      log('Claude Code を起動します…');
+      const claudeArgs = autoConfirm ? ['--permission-mode', 'acceptEdits', ...filteredArgs] : filteredArgs;
+      const result = spawnClaude(claudePath, claudeArgs, projectRoot);
+      const exitCode = typeof result.status === 'number' ? result.status : (result.error ? 1 : 0);
+      return { exitCode, scaffolded: state.scaffolded, claudeLaunched: true };
+    }
+
+    log('Claude Code が見つかりません。opencode を起動します…');
+    const opencodePath = resolveOpencode();
+    if (!opencodePath) {
+      log(claudeMissingGuidance());
+      return { exitCode: 1, scaffolded: state.scaffolded, opencodeLaunched: false };
+    }
+
+    const opencodeArgs = autoConfirm ? ['--auto', ...filteredArgs] : filteredArgs;
+    const result = spawnOpencode(opencodePath, opencodeArgs, projectRoot);
+    const exitCode = typeof result.status === 'number' ? result.status : (result.error ? 1 : 0);
+    return { exitCode, scaffolded: state.scaffolded, opencodeLaunched: true };
+  }
 }
 
-function defaultScaffold(projectRoot, assets) {
+async function defaultScaffold(projectRoot, assets) {
+  // scaffold 実装はパッケージ外（モノレポ workspace）と vendor 同梱（npm 配布時）の
+  // 両方があり得るため、静的 import ではなく assets で解決したパスを動的 import する。
+  const { createProject } = await import(pathToFileURL(assets.scaffoldModulePath).href);
   const scaffoldOptions = assets.skillsSourceDir
     ? { skillsSourceDir: assets.skillsSourceDir, schemasSourceDir: assets.schemasSourceDir ?? undefined }
     : {};
@@ -106,6 +170,10 @@ function defaultRunDoctor(doctorScript, projectRoot) {
 
 function defaultSpawnClaude(claudePath, args, projectRoot) {
   return spawnSync(claudePath, args, { stdio: 'inherit', cwd: projectRoot });
+}
+
+function defaultSpawnOpencode(opencodePath, args, projectRoot) {
+  return spawnSync(opencodePath, args, { stdio: 'inherit', cwd: projectRoot });
 }
 
 /**

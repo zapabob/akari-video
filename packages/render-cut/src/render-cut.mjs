@@ -37,6 +37,7 @@ import {
   runCheckedWithProgress,
 } from "./rasterize.mjs";
 import { renderReport } from "./report.mjs";
+import { resolveFfmpeg, resolveFfprobe } from "../../media-bin/src/index.mjs";
 
 const VERSION = 1;
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -419,8 +420,8 @@ async function validateLint(projectRoot, force) {
 }
 
 async function measureCapabilities(projectRoot, edit) {
-  const ffmpegCommand = process.env.FFMPEG ?? "ffmpeg";
-  const ffprobeCommand = process.env.FFPROBE ?? "ffprobe";
+  const ffmpegCommand = process.env.FFMPEG ?? resolveFfmpeg();
+  const ffprobeCommand = process.env.FFPROBE ?? resolveFfprobe();
   const ffmpegVersion = commandVersion(ffmpegCommand, ["-version"], "ffmpeg", ffmpegInstallHint());
   const ffprobeVersion = commandVersion(ffprobeCommand, ["-version"], "ffprobe");
   const chromePath = await findChromePath();
@@ -433,7 +434,7 @@ async function measureCapabilities(projectRoot, edit) {
     if (!Number.isFinite(sourceDuration) || sourceDuration <= 0) {
       throw new ExecutionError("ffprobe did not report a positive source duration");
     }
-    const hyperframesPath = join(PACKAGE_ROOT, "node_modules", ".bin", "hyperframes");
+    const hyperframesPath = join(PACKAGE_ROOT, "node_modules", "hyperframes", "bin", "hyperframes.mjs");
     const hyperframesPackagePath = join(PACKAGE_ROOT, "node_modules", "hyperframes", "package.json");
     const puppeteerPath = resolvePuppeteerPackagePath();
     return {
@@ -445,7 +446,7 @@ async function measureCapabilities(projectRoot, edit) {
       chromePath,
       chromeVersion,
       hyperframesPath,
-      hyperframesAvailable: await isExecutable(hyperframesPath),
+      hyperframesAvailable: await isReadable(hyperframesPath),
       hyperframesVersion: await readPackageVersion(hyperframesPackagePath),
       puppeteerAvailable: puppeteerPath !== null,
       puppeteerVersion: puppeteerPath ? await readPackageVersion(puppeteerPath) : null,
@@ -454,7 +455,7 @@ async function measureCapabilities(projectRoot, edit) {
     };
   }
 
-  const hyperframesPath = join(PACKAGE_ROOT, "node_modules", ".bin", "hyperframes");
+  const hyperframesPath = join(PACKAGE_ROOT, "node_modules", "hyperframes", "bin", "hyperframes.mjs");
   const hyperframesPackagePath = join(PACKAGE_ROOT, "node_modules", "hyperframes", "package.json");
   const puppeteerPath = resolvePuppeteerPackagePath();
   const shared = {
@@ -466,7 +467,7 @@ async function measureCapabilities(projectRoot, edit) {
     chromePath,
     chromeVersion,
     hyperframesPath,
-    hyperframesAvailable: await isExecutable(hyperframesPath),
+    hyperframesAvailable: await isReadable(hyperframesPath),
     hyperframesVersion: await readPackageVersion(hyperframesPackagePath),
     puppeteerAvailable: puppeteerPath !== null,
     puppeteerVersion: puppeteerPath ? await readPackageVersion(puppeteerPath) : null,
@@ -558,12 +559,14 @@ async function loadCaptions(projectRoot, edit) {
     return generateCaptionOverlays(captions, edit.cuts, {
       emphasisWords: edit.emphasis_words,
       defaultTextStyle,
+      output: edit.output,
     });
   }
   const warnings = [];
   const overlays = generateCaptionOverlays(captions, edit.cuts, {
     emphasisWords: edit.emphasis_words,
     defaultTextStyle,
+    output: edit.output,
     sourceCount: edit.version === 1 ? edit.sources.length : 1,
     linearTimeline: edit.version === 1,
     onWarning: (warning) => warnings.push(warning),
@@ -605,17 +608,22 @@ export async function rasterizeAndComposite(context) {
       "3D overlay requires the puppeteer-core path",
     );
   } else if (capabilities.hyperframesAvailable) {
-    const overlayPath = join(temporaryDirectory, "overlay.webm");
+    // mov (ProRes 4444), not webm: on Windows HyperFrames emits webm as vp9/yuv420p with no
+    // alpha channel, which the alpha probe below would reject on every run (issue #2).
+    const overlayPath = join(temporaryDirectory, "overlay.mov");
     try {
+      // The npm .bin shim is not spawnable on Windows (extensionless sh script; Node 22 also
+      // refuses .cmd without a shell), so launch the package entry through the node executable.
       runChecked(
-        capabilities.hyperframesPath,
+        process.execPath,
         [
+          capabilities.hyperframesPath,
           "render",
           projectRoot,
           "--composition",
           relative(projectRoot, sheetPath),
           "--format",
-          "webm",
+          "mov",
           "--fps",
           String(fps),
           "--workers",
@@ -769,7 +777,7 @@ async function cleanupStaleRunDirectories(renderTmpRoot) {
   );
 }
 
-export function verifyArtifact({ outputPath, plan, ffprobeCommand = "ffprobe" }) {
+export function verifyArtifact({ outputPath, plan, ffprobeCommand = resolveFfprobe() }) {
   const measured = probeMedia(ffprobeCommand, outputPath);
   const video = measured.streams.find((stream) => stream.codec_type === "video");
   const audio = measured.streams.find((stream) => stream.codec_type === "audio");
@@ -1115,6 +1123,17 @@ async function isRegularFile(path) {
 async function isExecutable(path) {
   try {
     await access(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// For files launched via process.execPath: X_OK is meaningless on Windows (any existing file
+// passes), and the script only needs to be readable by node.
+async function isReadable(path) {
+  try {
+    await access(path, fsConstants.R_OK);
     return true;
   } catch {
     return false;

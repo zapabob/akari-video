@@ -1,7 +1,7 @@
 {
   "private": true,
   "name": "@akari-video/shell",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "AKARI Video shell — Theia Electron app, S-A shell foundation (tabshell v0 contract).",
   "dependencies": {
     "@theia/core": "1.73.1",
@@ -31,6 +31,7 @@
     "akari-theme": "file:./extensions/akari-theme"
   },
   "devDependencies": {
+    "@electron/asar": "^3.4.1",
     "@theia/cli": "1.73.1",
     "electron": "39.8.7",
     "electron-builder": "^26.0.0",
@@ -68,11 +69,11 @@
   },
   "scripts": {
     "prebuild": "node resources/scripts/ensure-file-deps-linked.mjs",
-    "build:ext": "tsc -b extensions/akari-shell-strip extensions/akari-surfaces extensions/akari-project extensions/akari-partner extensions/akari-tabs extensions/akari-preview extensions/akari-transcript extensions/akari-annotations extensions/akari-theme",
+    "build:ext": "tsc -b extensions/akari-shell-strip extensions/akari-surfaces extensions/akari-project extensions/akari-partner extensions/akari-tabs extensions/akari-preview extensions/akari-annotations extensions/akari-transcript extensions/akari-theme",
     "build": "npm run build:ext && theia build --mode production",
     "lint": "eslint \"extensions/*/src/**/*.{ts,tsx}\"",
     "start": "theia start --plugins=local-dir:plugins",
-    "prepackage": "node resources/scripts/copy-native-helpers.mjs",
+    "prepackage": "node resources/scripts/copy-native-helpers.mjs && node resources/scripts/patch-ripgrep-asar-path.mjs && node resources/scripts/bundle-ffmpeg-binaries.mjs && node resources/scripts/generate-third-party-notices.mjs",
     "package": "electron-builder --dir",
     "postpackage": "node resources/scripts/verify-asar-contents.mjs",
     "watch": "theia build --watch --mode development"
@@ -107,10 +108,15 @@
     "asarUnpack": [
       "**/*.node",
       "lib/prebuilds/**/spawn-helper",
+      "lib/backend/native/**",
       "**/vscode-ripgrep/**",
       "**/@vscode/ripgrep/**"
     ],
     "extraResources": [
+      {
+        "from": "resources/generated-notices",
+        "to": "."
+      },
       {
         "from": "../../assets/font",
         "to": "assets/font"
@@ -123,6 +129,10 @@
           "bin/**/*",
           "src/**/*"
         ]
+      },
+      {
+        "from": "resources/vendor-ffmpeg",
+        "to": "media-bin"
       }
     ],
     "mac": {
@@ -136,6 +146,13 @@
     "win": {
       "icon": "resources/icons/icon.png",
       "target": "dir"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "shortcutName": "AKARI Video"
     },
     "linux": {
       "icon": "resources/icons/icon.png",

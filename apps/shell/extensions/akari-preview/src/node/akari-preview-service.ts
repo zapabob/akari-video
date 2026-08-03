@@ -1,5 +1,6 @@
 import { inject, injectable } from '@theia/core/shared/inversify';
 import { WorkspaceServer } from '@theia/workspace/lib/common';
+import { lintProjectCandidates } from '@akari-video/edit-store/lib/write-gate';
 import { spawn } from 'child_process';
 import { randomBytes } from 'crypto';
 import { createReadStream, readFileSync, rmdirSync, statSync, unlinkSync } from 'fs';
@@ -7,7 +8,7 @@ import { mkdtemp, readdir, readFile, realpath, rm, rmdir, stat, symlink, unlink,
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import { tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { parse as parseJson } from 'jsonc-parser';
 import {
     AppendReviewSessionAudioRequest,
@@ -31,7 +32,7 @@ import {
     VideoStreamReference,
     VideoStreamRequest
 } from '../common/akari-preview-protocol';
-import { getH264Proxy } from './hevc-proxy';
+import { getH264Proxy, resolveFfmpegPath } from './hevc-proxy';
 import { ReviewSessionWriter } from './review-session-writer';
 
 interface StreamTarget {
@@ -136,6 +137,7 @@ export class AkariPreviewServiceImpl implements AkariPreviewService {
             runtimeJavaScript: readFileSync(resolve(directory, 'overlay-runtime.js'), 'utf8'),
             interactionJavaScript: readFileSync(resolve(directory, 'interaction.js'), 'utf8'),
             interactionCss: readFileSync(resolve(directory, 'interaction.css'), 'utf8'),
+            webviewKernelJavaScript: readFileSync(this.findWebviewKernelBundle(), 'utf8'),
             captionFontDataUri: this.readCaptionFontDataUri()
         };
         return this.assets;
@@ -327,139 +329,26 @@ export class AkariPreviewServiceImpl implements AkariPreviewService {
         return this.reviewSessionWriter.list(request);
     }
 
-    // CF-write: layerWrite/audioWrite の書き込み前ゲート。候補全文を実ファイルへは一切書かず、
-    // 兄弟ファイル（source 動画・captions.json 等）をシンボリックリンクで写した一時ディレクトリに
-    // 候補 edit.json だけを置いて packages/edit-lint/bin/edit-lint.mjs --json を叩く
-    // （packages/edit-lint は「呼び出しのみ」— 改変しない）。
+    // CF-write: layerWrite/audioWrite/captionWrite の書き込み前ゲート。実装は
+    // packages/edit-store の共有カーネル（lintProjectCandidates — 一時ディレクトリに兄弟を
+    // symlink で写し、候補だけを置いて edit-lint --json・bin 不在は fail-open）へ委譲する。
+    // request.editUri は対象ファイルの URI（edit.json のほか captions.json 候補も検証できる —
+    // URI の basename が候補ファイル名になる）。
     async lintEditCandidate(request: LintEditCandidateRequest): Promise<LintEditCandidateResult> {
-        const editPath = this.filePath(request.editUri);
-        const projectRoot = dirname(editPath);
-        const tempRoot = await mkdtemp(resolve(tmpdir(), 'akari-lint-'));
-        try {
-            let siblingNames: string[] = [];
-            try {
-                siblingNames = await readdir(projectRoot);
-            } catch {
-                siblingNames = [];
-            }
-            await Promise.all(siblingNames.map(async name => {
-                if (name === 'edit.json') {
-                    return;
-                }
-                try {
-                    const targetStat = await stat(resolve(projectRoot, name));
-                    await symlink(resolve(projectRoot, name), resolve(tempRoot, name), targetStat.isDirectory() ? 'dir' : 'file');
-                } catch {
-                    // Reference is unreadable or a broken symlink; edit-lint will report it as a
-                    // missing-file finding on its own, same as it would against the real project.
-                }
-            }));
-            await writeFile(resolve(tempRoot, 'edit.json'), request.candidateText, 'utf8');
-            return await this.runEditLint(tempRoot);
-        } finally {
-            await rm(tempRoot, { recursive: true, force: true });
-        }
-    }
-
-    // 安全弁（fail-open 降格・2026-07-26 editlint-packaged-resolve）: bin 解決に失敗した
-    // 場合（パッケージ版に edit-lint が同梱されていない等）、書き込みを全面ブロックせず
-    // 検証スキップで続行する。編集不能より lint なし保存の方が被害が小さいという司令塔判断
-    // （schema 由来の型不正は各 write のローカル検証が別途残るため安全側は保たれる）。
-    protected async runEditLint(projectRoot: string): Promise<LintEditCandidateResult> {
-        let binPath: string;
-        try {
-            binPath = this.findEditLintBinPath();
-        } catch (error) {
-            this.warnEditLintUnavailableOnce(error);
-            return { pass: true, errors: [] };
-        }
-        // ELECTRON_RUN_AS_NODE: パッケージ版で process.execPath が Electron 実行体を指すため、
-        // 付与しないと node スクリプトではなく Electron アプリとして再起動してしまう
-        // （akari-project-service.ts の runNodeScript 等、既存の同型対処と同じ）。
-        const stdout = await new Promise<string>((resolveOutput, rejectOutput) => {
-            const chunks: Buffer[] = [];
-            const child = spawn(process.execPath, [binPath, projectRoot, '--json'], {
-                stdio: ['ignore', 'pipe', 'ignore'],
-                env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
-            });
-            child.stdout.on('data', chunk => chunks.push(chunk));
-            child.once('error', rejectOutput);
-            child.once('close', () => resolveOutput(Buffer.concat(chunks).toString('utf8')));
-        });
-        let parsed: { findings?: Array<{ severity?: string; message?: string; check?: string; path?: string }> };
-        try {
-            parsed = JSON.parse(stdout);
-        } catch (error) {
-            return { pass: false, errors: [`edit-lint の出力を解析できませんでした: ${error instanceof Error ? error.message : String(error)}`] };
-        }
-        const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
-        const errorFindings = findings.filter(finding => finding.severity === 'error');
-        return {
-            pass: errorFindings.length === 0,
-            errors: errorFindings.map(finding => `[${finding.check ?? 'edit-lint'}] ${finding.message ?? '不明なエラー'}`)
-        };
-    }
-
-    protected findEditLintBinPath(): string {
-        const candidates: string[] = [];
-
-        const packagedCandidate = resolve(__dirname, '../edit-lint/bin/edit-lint.mjs');
-        candidates.push(packagedCandidate);
-        if (this.isFile(packagedCandidate)) {
-            return packagedCandidate;
-        }
-
-        let ancestor = resolve(__dirname);
-        for (let depth = 0; depth < 10; depth++) {
-            const candidate = resolve(ancestor, 'packages/edit-lint/bin/edit-lint.mjs');
-            candidates.push(candidate);
-            if (this.isFile(candidate)) {
-                return candidate;
-            }
-            const parent = dirname(ancestor);
-            if (parent === ancestor) {
-                break;
-            }
-            ancestor = parent;
-        }
-
-        const cwdCandidates = [
-            resolve(process.cwd(), '../../packages/edit-lint/bin/edit-lint.mjs'),
-            resolve(process.cwd(), 'packages/edit-lint/bin/edit-lint.mjs'),
-            resolve(process.cwd(), '../packages/edit-lint/bin/edit-lint.mjs')
-        ];
-        for (const candidate of cwdCandidates) {
-            if (candidates.includes(candidate)) {
-                continue;
-            }
-            candidates.push(candidate);
-            if (this.isFile(candidate)) {
-                return candidate;
-            }
-        }
-        throw new Error(`edit-lint bin was not found (tried: ${candidates.join(', ')})`);
-    }
-
-    protected editLintUnavailableWarned = false;
-
-    // 安全弁の警告 notice（初回のみ）。widget（browser）側は本タスクの境界外のため変更せず、
-    // ここではプロセスログへの明示的な警告として実装する（バックエンドログ・開発者ツールの
-    // コンソールから確認可能）。
-    protected warnEditLintUnavailableOnce(error: unknown): void {
-        if (this.editLintUnavailableWarned) {
-            return;
-        }
-        this.editLintUnavailableWarned = true;
-        console.warn(
-            '[akari-preview] edit-lint bin が見つからないため、検証なしで保存しています。',
-            error instanceof Error ? error.message : error
+        const targetPath = this.filePath(request.editUri);
+        const result = await lintProjectCandidates(
+            dirname(targetPath), { [basename(targetPath)]: request.candidateText }
         );
+        return { pass: result.pass, errors: result.errors };
     }
 
-    protected runAudioTranscode(inputPath: string, outputPath: string): Promise<TranscodeAudioErrorKind | undefined> {
+    protected async runAudioTranscode(inputPath: string, outputPath: string): Promise<TranscodeAudioErrorKind | undefined> {
+        // task/2026-07-31-shell-ffmpeg-bundle: PATH に無ければ hevc-proxy.ts と同じ優先順位
+        // （明示指定env → PATH → アプリ同梱バイナリ）でアプリ同梱の ffmpeg を使う。
+        const ffmpegPath = await resolveFfmpegPath() ?? 'ffmpeg';
         return new Promise(resolveResult => {
             let settled = false;
-            const child = spawn('ffmpeg', [
+            const child = spawn(ffmpegPath, [
                 '-hide_banner',
                 '-loglevel', 'error',
                 '-nostdin',
@@ -756,6 +645,36 @@ export class AkariPreviewServiceImpl implements AkariPreviewService {
             }
         }
         throw new Error(`overlay-runtime assets were not found (tried: ${candidates.join(', ')})`);
+    }
+
+    // 共有カーネルの webview 用 IIFE バンドル（generated — 正本は packages/edit-store/src/
+    // webview-kernel.ts、`npm run build` が lib/webview-kernel.js を再生成する）。
+    // overlay-runtime と違い生成物のため src/ には置けず、edit-store の lib/ から読む。
+    // パッケージ済みアプリでは copy-native-helpers.mjs が lib/overlay-runtime/ へ同梱する。
+    protected findWebviewKernelBundle(): string {
+        const fileName = 'webview-kernel.js';
+        const candidates: string[] = [];
+
+        const packagedCandidate = resolve(__dirname, '../overlay-runtime', fileName);
+        candidates.push(packagedCandidate);
+        if (this.isFile(packagedCandidate)) {
+            return packagedCandidate;
+        }
+
+        let ancestor = resolve(__dirname);
+        for (let depth = 0; depth < 10; depth++) {
+            const candidate = resolve(ancestor, 'packages/edit-store/lib', fileName);
+            candidates.push(candidate);
+            if (this.isFile(candidate)) {
+                return candidate;
+            }
+            const parent = dirname(ancestor);
+            if (parent === ancestor) {
+                break;
+            }
+            ancestor = parent;
+        }
+        throw new Error(`webview-kernel bundle was not found (tried: ${candidates.join(', ')})`);
     }
 
     protected isOverlayRuntimeDirectory(candidate: string): boolean {

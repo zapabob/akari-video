@@ -21,15 +21,17 @@ import {
   resolveCutTrackRanges,
 } from "./track-compose.mjs";
 import { resolveTrackOrder, usesDefaultTrackOrder } from "./track-order.mjs";
+import { resolveFfmpeg, resolveFfprobe } from "../../media-bin/src/index.mjs";
 
 // docs/contract-2026-07-14-edit-json-v1-audio.md §4: sidechaincompress threshold ~-24dB (linear 0.063), ratio 8, attack 5ms, release 300ms.
 const DUCKING_SIDECHAIN_ARGS = "threshold=0.063:ratio=8:attack=5:release=300";
 // docs/contract-2026-07-20-edit-json-v1-narration.md §1: gain_db clamp range, shared with bgm/sfx.
 const GAIN_DB_MIN = -60;
 const GAIN_DB_MAX = 12;
-// catalog/luts/<id>/<id>.cube — packages/render-cut/src/../../.. is the monorepo root, sibling to
-// catalog/ (see catalog/luts/INDEX.md for the bare-name catalog reference convention).
-const CATALOG_LUTS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "catalog", "luts");
+// presets/luts/<id>/<id>.cube — packages/render-cut/src/../../.. is the monorepo root, sibling to
+// presets/ (see presets/luts/INDEX.md for the bare-name preset reference convention). Moved from
+// catalog/luts on 2026-07-29: LUTs are a lookup table resolved by id in code, not a library asset.
+const PRESETS_LUTS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "presets", "luts");
 
 export function buildPlan({
   edit,
@@ -70,7 +72,6 @@ export function buildPlan({
   const cutPath = join(temporary, "cut.mp4");
   const tailPaddedPath = join(temporary, "cut-tail-padded.mp4");
   const layeredPath = join(temporary, "layered.mp4");
-  const overlayWebmPath = join(temporary, "overlay.webm");
   const overlayMovPath = join(temporary, "overlay.mov");
   const compositePath = join(temporary, "composite.mp4");
   const finalPath = join(temporary, "final.mp4");
@@ -179,7 +180,6 @@ export function buildPlan({
       ...(layers ? [layeredPath] : []),
       ...(trackStack ? trackStack.intermediates : []),
       sheetPath,
-      overlayWebmPath,
       overlayMovPath,
       join(temporary, "frames", "frame-%08d.png"),
       ...renderOverlays.flatMap((_, index) => {
@@ -194,19 +194,20 @@ export function buildPlan({
       tail_pad: tailPad,
       rasterize: {
         hyperframes: {
-          command: localBinary(projectRoot, "hyperframes"),
+          command: process.execPath,
           cwd: projectRoot,
           env: {
             HYPERFRAMES_BROWSER_PATH: capabilities.chromePath,
             DO_NOT_TRACK: "1",
           },
           args: [
+            hyperframesEntry(),
             "render",
             ".",
             "--composition",
             relative(projectRoot, sheetPath),
             "--format",
-            "webm",
+            "mov",
             "--fps",
             String(fps),
             "--workers",
@@ -214,7 +215,7 @@ export function buildPlan({
             "--no-browser-gpu",
             "--no-best-effort",
             "-o",
-            relative(projectRoot, overlayWebmPath),
+            relative(projectRoot, overlayMovPath),
           ],
         },
         "puppeteer-core": {
@@ -235,7 +236,7 @@ export function buildPlan({
         hyperframes: buildAnimatedCompositeCommand(
           capabilities.ffmpegCommand,
           baseVideoPath,
-          overlayWebmPath,
+          overlayMovPath,
           compositePath,
           videoEncodeArgs,
         ),
@@ -404,8 +405,8 @@ export function buildAudioMixCommand({
   inputPath,
   outputPath,
   duration,
-  ffmpegCommand = "ffmpeg",
-  ffprobeCommand = "ffprobe",
+  ffmpegCommand = resolveFfmpeg(),
+  ffprobeCommand = resolveFfprobe(),
 }) {
   const audio = normalizeAudioPlan(edit.audio);
   const { tracks: narrationTracks, warnings } = resolveNarrationTracks({
@@ -699,12 +700,12 @@ function buildStaticCompositeCommand(command, cutPath, outputPath, temporary, ov
   return { command, args };
 }
 
-// docs/contract-2026-07-22-render-basics.md #4: "lut(カタログ参照 or パス)" — a bare name (no
-// path separator) resolves against catalog/luts/<name>/<name>.cube; anything else is treated as a
+// docs/contract-2026-07-22-render-basics.md #4: "lut(プリセット参照 or パス)" — a bare name (no
+// path separator) resolves against presets/luts/<name>/<name>.cube; anything else is treated as a
 // path relative to the project root (same regel as source.path / audio.bgm.path elsewhere).
 function resolveLutPath(projectRoot, lutRef) {
   if (!lutRef.includes("/") && !lutRef.includes("\\")) {
-    return join(CATALOG_LUTS_ROOT, lutRef, `${lutRef}.cube`);
+    return join(PRESETS_LUTS_ROOT, lutRef, `${lutRef}.cube`);
   }
   return resolve(projectRoot, lutRef);
 }
@@ -865,7 +866,7 @@ export function buildCutCommand({
   fps,
   hasAudio,
   duration,
-  ffmpegCommand = "ffmpeg",
+  ffmpegCommand = resolveFfmpeg(),
   projectRoot,
   look,
   chromaKey,
@@ -1070,7 +1071,7 @@ export function buildMultiSourceCutCommand({
   width,
   height,
   fps,
-  ffmpegCommand = "ffmpeg",
+  ffmpegCommand = resolveFfmpeg(),
   projectRoot,
   look,
   videoEncodeArgs = null,
@@ -1178,7 +1179,7 @@ function buildGapAwareCutCommand({
   fps,
   hasAudio,
   duration,
-  ffmpegCommand = "ffmpeg",
+  ffmpegCommand = resolveFfmpeg(),
   projectRoot,
   look,
   chromaKey,
@@ -1419,8 +1420,10 @@ function selectRasterizer(capabilities, hasThreeDimensionalOverlay) {
   return "static-screenshot";
 }
 
-function localBinary(_projectRoot, name) {
-  return fileURLToPath(new URL(`../node_modules/.bin/${name}`, import.meta.url));
+// The npm .bin shim is not spawnable on Windows, so the plan advertises the same
+// node + package-entry invocation that execution uses (see rasterizeAndComposite).
+function hyperframesEntry() {
+  return fileURLToPath(new URL("../node_modules/hyperframes/bin/hyperframes.mjs", import.meta.url));
 }
 
 function relativeOrAbsolute(root, value) {

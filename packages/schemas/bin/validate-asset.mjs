@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const usage = "使い方: node packages/schemas/bin/validate-asset.mjs assets/telop/<id>";
+const usage = "使い方: node packages/schemas/bin/validate-asset.mjs assets/overlay/<id>";
 const assetArgument = process.argv[2];
 
 if (!assetArgument || process.argv.length !== 3) {
@@ -68,9 +68,9 @@ function validateMeta(value) {
     "license",
     "price",
   ];
-  // source / remote / matched_by は任意フィールド。
-  // 後方互換のため必須フィールドには加えない。
-  const optionalFields = ["source", "remote", "matched_by"];
+  // source / remote / matched_by / version / min_app_version は任意フィールド。
+  // 後方互換のため必須フィールドには加えない（version は 2026-07-30 導入で、既存エントリは未設定）。
+  const optionalFields = ["source", "remote", "matched_by", "version", "min_app_version"];
   const allowedFields = [...requiredFields, ...optionalFields];
   for (const field of requiredFields) {
     if (!hasOwn(value, field)) fail(`必須フィールドがありません: ${field}`);
@@ -84,9 +84,10 @@ function validateMeta(value) {
     fail("id は英小文字・数字の kebab-case である必要があります");
   }
 
-  const categories = new Set(["3d", "motion", "telop", "audio", "broll", "font", "thumbnail"]);
+  // 2026-07-29: 主題（3d/motion/telop/thumbnail）から配布物の形へ切り替え。主題は tags に逃がす。
+  const categories = new Set(["overlay", "still", "scene3d", "audio", "broll", "font"]);
   if (typeof value.category !== "string" || !categories.has(value.category)) {
-    fail("category は 3d / motion / telop / audio / broll / font / thumbnail のいずれかである必要があります");
+    fail("category は overlay / still / scene3d / audio / broll / font のいずれかである必要があります");
   }
 
   for (const field of ["title", "description", "when_to_use", "ai_usage", "author"]) {
@@ -101,6 +102,16 @@ function validateMeta(value) {
 
   if (value.price !== null && (!isFiniteNumber(value.price) || value.price < 0)) {
     fail("price は null または 0 以上の有限数である必要があります");
+  }
+
+  if (hasOwn(value, "version")) {
+    if (!Number.isInteger(value.version) || value.version < 1) {
+      fail("version は 1 以上の整数である必要があります");
+    }
+  }
+
+  if (hasOwn(value, "min_app_version") && !/^\d+\.\d+\.\d+$/.test(String(value.min_app_version))) {
+    fail("min_app_version は x.y.z 形式である必要があります");
   }
 
   const matchedByValues = new Set(["title-normalized"]);
@@ -331,23 +342,23 @@ function validateFiles() {
   }
 
   const category = path.basename(path.dirname(assetDir));
-  if (["motion", "telop", "thumbnail"].includes(category)) {
+  if (["overlay", "still"].includes(category)) {
     const fragmentPath = path.join(assetDir, "fragment.html");
     if (!isRegularFile(fragmentPath)) {
       fail(`${category} 素材には fragment.html が必要です`);
     }
   }
 
-  if (category === "3d") {
-    // 3d は fragment.html（経路 A: オーバーレイ）か scene.py（経路 B: ベイクレシピ）のどちらか一方
+  if (category === "scene3d") {
+    // scene3d は fragment.html（経路 A: オーバーレイ）か scene.py（経路 B: ベイクレシピ）のどちらか一方
     // （契約: docs/contract-2026-07-14-3d-bake-recipe.md）
     const hasFragment = isRegularFile(path.join(assetDir, "fragment.html"));
     const hasScene = isRegularFile(path.join(assetDir, "scene.py"));
     if (hasFragment === hasScene) {
-      fail("3d 素材は fragment.html（オーバーレイ）か scene.py（ベイクレシピ）のどちらか一方を実体に持つ必要があります");
+      fail("scene3d 素材は fragment.html（オーバーレイ）か scene.py（ベイクレシピ）のどちらか一方を実体に持つ必要があります");
     }
     if (hasFragment && !payloadFiles.some((filePath) => /\.(?:glb|gltf)$/i.test(filePath))) {
-      fail("3d オーバーレイ素材には glTF 実体（.glb または .gltf）が必要です");
+      fail("scene3d 素材には glTF 実体（.glb または .gltf）が必要です");
     }
   }
 

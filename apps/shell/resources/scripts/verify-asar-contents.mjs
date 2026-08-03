@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { listPackage, extractFile } from '@electron/asar';
 import { fileURLToPath } from 'node:url';
 
 const shellRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -135,6 +135,40 @@ if (applications.length === 0) {
 const fileDependencies = Object.entries(packageJson.dependencies ?? {})
   .filter(([, specification]) => typeof specification === 'string' && specification.startsWith('file:'))
   .map(([name]) => name);
+
+// 自社 file: 依存を再帰収集する（ThirdPartyNotices 照合の除外用）。拡張がさらに file: で
+// 自社共有カーネル（例 @akari-video/edit-store / pen-visuals）へ依存する形が生まれたため、
+// shell 直下 1 階層の fileDependencies だけでは除外から取りこぼして誤検知する。
+// generate-third-party-notices.mjs の「file: 依存 = 自社拡張。通知対象にせず依存だけ辿る」と
+// 同じ深さで辿る（直上の fileDependencies は asar 内の拡張存在検査用で、従来どおり直下のみ）。
+async function collectFirstPartyPackageNames(rootManifest, rootDir) {
+  const names = new Set();
+  const visited = new Set();
+  const queue = [{ manifest: rootManifest, dir: rootDir }];
+  while (queue.length > 0) {
+    const { manifest, dir } = queue.shift();
+    for (const [name, specification] of Object.entries(manifest.dependencies ?? {})) {
+      if (typeof specification !== 'string' || !specification.startsWith('file:')) {
+        continue;
+      }
+      names.add(name);
+      const dependencyDir = path.resolve(dir, specification.slice('file:'.length));
+      if (visited.has(dependencyDir)) {
+        continue;
+      }
+      visited.add(dependencyDir);
+      try {
+        const dependencyManifest = JSON.parse(await readFile(path.join(dependencyDir, 'package.json'), 'utf8'));
+        queue.push({ manifest: dependencyManifest, dir: dependencyDir });
+      } catch {
+        // package.json が読めない file: 依存はここでは無視する（存在の検証は別段の責務）
+      }
+    }
+  }
+  return names;
+}
+const firstPartyPackageNames = await collectFirstPartyPackageNames(packageJson, shellRoot);
+
 let failed = false;
 const verified = [];
 
@@ -145,11 +179,7 @@ for (const application of applications.sort((a, b) => a.displayPath.localeCompar
     // Windows の asar list はエントリをバックスラッシュ区切りで返すため、以降の
     // `/lib/...` 前提の照合が全滅する（CI run 30000812912 実測: 547MB の asar 全項目 MISSING）。
     // 区切りを '/' に正規化してから照合する。
-    entries = execSync(`npx --yes @electron/asar list ${JSON.stringify(asar)}`, {
-      cwd: shellRoot,
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024
-    }).split(/\r?\n/).filter(Boolean).map(entry => entry.replace(/\\/g, '/'));
+    entries = listPackage(asar, { isPack: false }).map(entry => entry.replace(/\\/g, '/'));
   } catch (error) {
     console.error(`❌ app.asar を読み取れません: ${path.relative(shellRoot, asar)}`);
     console.error(error instanceof Error ? error.message : String(error));
@@ -199,6 +229,99 @@ for (const application of applications.sort((a, b) => a.displayPath.localeCompar
       console.log(`✅ ${check.label}`);
     } else {
       console.error(`❌ MISSING: ${check.label}（platform=${targetPlatform}）`);
+      failed = true;
+    }
+  }
+
+  // issue #5: ripgrep は child_process.spawn で起動するため asar 内では実行できない
+  // （Electron は require の asar → asar.unpacked リダイレクトはするが spawn はしない。
+  // win 実機 ENOENT / mac 実測 ENOTDIR）。asar 内エントリ検査だけでは「unpack される
+  // べきものが unpack されていない」を検出できず今回すり抜けたため、検収は 2 点:
+  // (1) rg 実体が app.asar.unpacked 側に存在し実行可能であること
+  //     （build.asarUnpack の lib/backend/native/** が効いている証拠）
+  // (2) asar 内 lib/backend/main.js の rgPath が asar.unpacked 置換を持つこと
+  //     （prepackage の patch-ripgrep-asar-path.mjs の適用痕）
+  const rgName = targetPlatform === 'win32' ? 'rg.exe' : 'rg';
+  const rgUnpacked = path.join(`${asar}.unpacked`, 'lib', 'backend', 'native', rgName);
+  const rgStat = await stat(rgUnpacked).then(s => s, () => null);
+  const rgExecutable = rgStat != null && rgStat.isFile()
+    && (targetPlatform === 'win32' || (rgStat.mode & 0o111) !== 0);
+  if (rgExecutable) {
+    console.log(`✅ ripgrep unpacked（app.asar.unpacked/lib/backend/native/${rgName}）`);
+  } else {
+    console.error(
+      `❌ MISSING/NOT-EXECUTABLE: app.asar.unpacked/lib/backend/native/${rgName}` +
+      '（issue #5 — build.asarUnpack の lib/backend/native/** を確認）'
+    );
+    failed = true;
+  }
+  // asar 内エントリの取り出しは @electron/asar を直接 import して呼ぶ（CLI をシェル経由で
+  // 叩かない）。issue #5 の Windows 実機報告で、旧実装の
+  // `execSync(... ${JSON.stringify(path.join('lib','backend','main.js'))})` が win32 で
+  // false-fail することが判明したため（= 配布可能なパッケージを「配布禁止」と誤判定する）。
+  // 機構: win32 では path.join が 'lib\backend\main.js' を返し、JSON.stringify がそれを
+  // '"lib\\backend\\main.js"' へエスケープする。cmd.exe は二重引用符しか剥がさず
+  // バックスラッシュのエスケープを解釈しないので、CLI には区切りが二重化した文字列が渡る。
+  // アーカイブ内の検索は path.sep 分割（@electron/asar filesystem.js の searchNodeFromPath）
+  // なので空セグメントが混入して miss する。mac 上の等価再現（区切りを '//' に二重化）でも
+  // 同一の "was not found in this archive" になることを実測済み。
+  // なお archivePath 側は Windows の FS が '\\' を吸収するため開けてしまい、
+  // アーカイブ内キーの照合だけが落ちる、という非対称な壊れ方をしていた。
+  // 引数を文字列連結でシェルに渡さなければ区切り・引用符の解釈段が消える。
+  // 検索キーは path.sep 分割に合わせるため path.join のまま（正規化してはいけない）。
+  try {
+    const bundledMain = extractFile(asar, path.join('lib', 'backend', 'main.js')).toString('utf8');
+    if (bundledMain.includes('app.asar.unpacked$1')) {
+      console.log('✅ rgPath asar.unpacked 置換（patch-ripgrep-asar-path 適用痕）');
+    } else {
+      console.error(
+        '❌ rgPath が素の asar パスのまま（prepackage の patch-ripgrep-asar-path.mjs 未適用 — issue #5）'
+      );
+      failed = true;
+    }
+  } catch (error) {
+    console.error(
+      '❌ asar 内 lib/backend/main.js の rgPath 検査に失敗:',
+      error instanceof Error ? error.message : String(error)
+    );
+    failed = true;
+  }
+
+  // サードパーティライセンス通知の同梱検査。生成は prepackage の
+  // generate-third-party-notices.mjs、配置は extraResources("." は mac: Contents/Resources、
+  // win/linux: resources/ に展開される)。存在 3 点に加え、asar 内 top-level パッケージ全数が
+  // ThirdPartyNotices.txt に掲載されていることを照合する(walker の取りこぼし検知。
+  // 自社 file: 拡張はサードパーティではないので照合から除く)。
+  const resourcesDir = targetPlatform === 'darwin'
+    ? path.join(application.displayPath, 'Contents', 'Resources')
+    : path.join(application.displayPath, 'resources');
+  for (const noticeFile of ['ThirdPartyNotices.txt', 'LICENSE.electron.txt', 'LICENSES.chromium.html']) {
+    const exists = await stat(path.join(resourcesDir, noticeFile)).then(s => s.isFile(), () => false);
+    if (exists) {
+      console.log(`✅ ${noticeFile}`);
+    } else {
+      console.error(`❌ MISSING: ${noticeFile}(リソース直下)`);
+      failed = true;
+    }
+  }
+  const noticesText = await readFile(path.join(resourcesDir, 'ThirdPartyNotices.txt'), 'utf8').catch(() => null);
+  if (noticesText !== null) {
+    const asarPackageNames = new Set();
+    for (const entry of entries) {
+      const match = entry.match(/^\/node_modules\/(@[^/]+\/[^/]+|[^@./][^/]*)\//);
+      if (match) {
+        asarPackageNames.add(match[1]);
+      }
+    }
+    const firstParty = firstPartyPackageNames;
+    const missingFromNotices = [...asarPackageNames]
+      .filter(name => !firstParty.has(name))
+      .filter(name => !noticesText.includes(`%% ${name}@`))
+      .sort();
+    if (missingFromNotices.length === 0) {
+      console.log(`✅ ThirdPartyNotices 網羅（asar 内 ${asarPackageNames.size} パッケージ照合）`);
+    } else {
+      console.error(`❌ ThirdPartyNotices 不掲載: ${missingFromNotices.join(', ')}`);
       failed = true;
     }
   }

@@ -29,6 +29,30 @@ export interface PartnerLaunchPlan {
     agent: PartnerAgentId;
     args: string[];
     log: string[];
+    /**
+     * Extra environment variables to merge into the partner PTY's environment
+     * (task/2026-07-31-shell-ffmpeg-bundle). Currently AKARI_FFMPEG_BIN / AKARI_FFPROBE_BIN,
+     * resolved node-side so skill scripts inside the PTY (which import
+     * packages/media-bin's resolveFfmpeg/resolveFfprobe) see the same explicit-env tier the
+     * app itself resolved to (PATH when available, otherwise the app-bundled binary).
+     */
+    env?: Record<string, string>;
+}
+
+/**
+ * アプリ単位の「パートナー接続済み」マーカーの中身
+ * （既定の置き場は `~/.akari/partner-connection.json`。ルートは環境変数
+ * `AKARI_HOME` で差し替え可 — `packages/akari-launcher` の `update-check.json`
+ * と同じ規約）。プロジェクト内の `.akari/connections.json` がワークスペース
+ * 単位の接続レジストリなのに対し、こちらは「このアプリではもう初回ではない」
+ * だけを表す最小の状態。
+ */
+export interface PartnerConnectionMarker {
+    schema: 1;
+    status: 'ok';
+    agent: PartnerAgentId;
+    executablePath: string;
+    connected_at: string;
 }
 
 /**
@@ -55,4 +79,11 @@ export interface AkariPartnerServer {
     verifyExtensionBinary(request: BinaryVerificationRequest): Promise<BinaryVerificationResult>;
     prepareLaunch(agent: PartnerAgentId): Promise<PartnerLaunchPlan>;
     getRenderPins(): Promise<RenderPins>;
+    /**
+     * 接続成立時にアプリ単位マーカーを書き、書いた内容を返す。フロントエンドが
+     * ホームディレクトリを直接触らないための薄い RPC（`AKARI_HOME` の解決も
+     * node 側で行う）。失敗は例外として呼び出し側へ伝わるが、呼び出し側は
+     * 警告ログだけ出して接続フローを止めない（沈黙原則）。
+     */
+    recordConnection(agent: PartnerAgentId, executablePath: string): Promise<PartnerConnectionMarker>;
 }

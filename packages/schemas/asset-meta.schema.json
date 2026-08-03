@@ -27,7 +27,8 @@
     },
     "category": {
       "type": "string",
-      "enum": ["3d", "motion", "telop", "audio", "broll", "font", "thumbnail"]
+      "$comment": "2026-07-29 に主題（3d/motion/telop/thumbnail…）から配布物の形へ切り替えた。overlay=時間を持つ HTML 断片 / still=時間を持たない HTML シート / scene3d=glTF+Three.js またはベイクレシピ / audio=音声トラックに載るバイナリ / broll=映像トラックに載る実写バイナリ / font=書体バイナリ。主題は tags に逃がす（カテゴリを増やさない）。",
+      "enum": ["overlay", "still", "scene3d", "audio", "broll", "font"]
     },
     "title": {
       "type": "string",
@@ -93,6 +94,16 @@
     "matched_by": {
       "$comment": "drop-folder タイトル正規化照合の来歴フィールド（2026-07-22 導入）。将来の照合経路追加時は enum を拡張する。",
       "enum": ["title-normalized"]
+    },
+    "version": {
+      "$comment": "素材の版（2026-07-30 導入。data-contract-versioning 契約 §3 の宿題を果たすもの）。初版は 1。ツマミの削除・改名・type/unit 変更・範囲の縮小、クラス構造やスロットの変更は破壊的変更として bump する。ラベル・説明・tags・ai_usage の更新では上げない。harness/knob-diff.mjs が bump 漏れを検出する。",
+      "type": "integer",
+      "minimum": 1
+    },
+    "min_app_version": {
+      "$comment": "この素材が要求する AKARI Video の最低版（任意）。古い版で開いたら推測せず正直に止まるための宣言（versioning 契約 原則 3 と同型）。特定版を要求しない素材では省略する。",
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
     },
     "remote": {
       "type": "boolean",

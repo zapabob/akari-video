@@ -25,7 +25,18 @@ const TEXTURE_MIME_TYPES = new Map([
   [".png", "image/png"],
   [".svg", "image/svg+xml"],
   [".webp", "image/webp"],
+  // 動画テクスチャ。原本ではなく編集用 720p プロキシを差すこと（skills/overlay-authoring/3d.md）
+  [".m4v", "video/mp4"],
+  [".mov", "video/quicktime"],
+  [".mp4", "video/mp4"],
+  [".webm", "video/webm"],
 ]);
+// 動画テクスチャの上限。「原本を黙って通さない」（skills/overlay-authoring/3d.md）を実際に効かせる。
+// 解像度ではなくバイト数で見るのは、シート生成が同期・純関数で ffprobe を呼ばないため
+// （呼ぶと単体テストが使う極小のダミー動画も読めなくなる）。24MB は 720p / H.264 / CRF 23 なら
+// 数分ぶんに相当し、実運用のプロキシは通るが 4K マスターは通らない目安。
+// 埋め込みは base64（約 1.37 倍）になり、プレビューは毎 tick これをシークする
+const MAX_VIDEO_TEXTURE_BYTES = 24 * 1024 * 1024;
 
 export function renderOverlaySheet({ overlays, edit, projectRoot, duration }) {
   const orderedOverlays = orderOverlaysByTrack(overlays);
@@ -44,8 +55,24 @@ export function renderOverlaySheet({ overlays, edit, projectRoot, duration }) {
   const threeRuntimeScripts = hasThreeDimensionalOverlay
     ? `\n  <script>${inlineScript(readFileSync(THREE_BUNDLE_PATH, "utf8"))}</script>\n  <script>${inlineScript(readFileSync(THREE_RUNTIME_PATH, "utf8"))}</script>`
     : "";
+  // 3D は「動画テクスチャのシークが終わってから」描く。ここで描いてしまうと <video> がまだ
+  // 前フレームの絵のままテクスチャへ上がり、同じ時刻でも直前に何を撮ったかで結果が変わる。
+  // 収集だけ先にして、実際の描画は video の提示フレーム確定後（threeDrawStep）へ回す
+  const threeSeekCollector = hasThreeDimensionalOverlay
+    ? `\n      const pendingThreeDraws = [];`
+    : "";
   const threeSeekBranch = hasThreeDimensionalOverlay
-    ? `\n        const threeContainer = container.querySelector(':scope > .scene-content');\n        if (active && threeContainer?.querySelector('script[type="application/json"][data-akari-3d-scene]')) {\n          window.akari.threeRuntime.render(threeContainer, seconds - start);\n        }`
+    ? `\n        const threeContainer = container.querySelector(':scope > .scene-content');\n        if (active && threeContainer?.querySelector('script[type="application/json"][data-akari-3d-scene]')) {\n          pendingThreeDraws.push([threeContainer, seconds - start]);\n        }`
+    : "";
+  const threeDrawStep = hasThreeDimensionalOverlay
+    ? `\n      for (const [threeContainer, localSeconds] of pendingThreeDraws) {\n        window.akari.threeRuntime.render(threeContainer, localSeconds);\n      }`
+    : "";
+  // 3D の動画テクスチャはランタイムが loop を立てて作るので、素材の尺より合成が長いときは
+  // 畳んで回す（畳まないと末尾のフレームで静止する）。2D だけのシートは従来どおり
+  // 合成時刻をそのまま渡す — 非 3D シートのバイト同一性を崩さないため宣言ごと出し分ける
+  const videoSeekTarget = hasThreeDimensionalOverlay ? "target" : "seconds";
+  const videoSeekTargetDeclaration = hasThreeDimensionalOverlay
+    ? `\n          const target = video.loop && Number.isFinite(video.duration) && video.duration > 0\n            ? seconds % video.duration\n            : seconds;`
     : "";
   const threeReadySetup = hasThreeDimensionalOverlay
     ? `\n    const threeContainers = Array.from(document.querySelectorAll('.akari-overlay-container > .scene-content')).filter((container) =>\n      container.querySelector('script[type="application/json"][data-akari-3d-scene]')\n    );\n    for (const container of threeContainers) {\n      window.akari.threeRuntime.render(container, 0);\n    }\n    async function waitForThreeContainer(container) {\n      while (true) {\n        const status = window.akari.threeRuntime.inspect(container).status;\n        if (status === 'ready') return;\n        if (status === 'error') {\n          console.error('[akari-three] 3D scene の読み込みエラーを fallback 表示のまま続行します');\n          return;\n        }\n        if (status !== 'loading') {\n          console.error('[akari-three] 3D scene を初期化できないため fallback 表示のまま続行します', status);\n          return;\n        }\n        await new Promise((resolve) => setTimeout(resolve, 10));\n      }\n    }`
@@ -70,18 +97,91 @@ export function renderOverlaySheet({ overlays, edit, projectRoot, duration }) {
 ${nodes}
   </div>
   <script>
-    window.__akariSeek = async function(seconds) {
+    // Overlay fragments author entrance animations as plain CSS keyframes, but plain CSS
+    // animations cannot survive a HyperFrames render: its producer free-runs this sheet on
+    // a virtual clock (so they finish during page setup), and its deterministic CSS adapter
+    // re-seeks them to composition time with no clip offset right before every frame
+    // capture, baking the fill end state (issue #3). Convert each authored CSS animation
+    // into a paused WAAPI clone whose delay absorbs the container's start instead: a write
+    // of currentTime = composition time then lands every clone on the correct local frame
+    // no matter which writer runs last — __akariSeek (puppeteer-core), the transport hold
+    // loop below (HyperFrames), or HyperFrames' own WAAPI adapter. Disabling animation-name
+    // afterwards cancels the originals so nothing free-runs or double-drives the elements.
+    (function() {
+      for (const container of document.querySelectorAll('.akari-overlay-container')) {
+        const startMilliseconds = Number(container.dataset.start) * 1000;
+        const conversions = [];
+        for (const animation of container.getAnimations({ subtree: true })) {
+          if (typeof CSSAnimation === 'undefined' || !(animation instanceof CSSAnimation)) continue;
+          const effect = animation.effect;
+          if (!effect || typeof effect.getKeyframes !== 'function' || !effect.target) continue;
+          try {
+            conversions.push({
+              target: effect.target,
+              keyframes: effect.getKeyframes(),
+              timing: effect.getTiming(),
+            });
+          } catch {}
+        }
+        for (const conversion of conversions) {
+          conversion.target.style.animationName = 'none';
+        }
+        for (const conversion of conversions) {
+          const timing = conversion.timing;
+          try {
+            const clone = conversion.target.animate(conversion.keyframes, {
+              delay: (Number(timing.delay) || 0) + startMilliseconds,
+              endDelay: timing.endDelay,
+              duration: timing.duration,
+              iterations: timing.iterations,
+              iterationStart: timing.iterationStart,
+              direction: timing.direction,
+              easing: timing.easing,
+              fill: 'both',
+            });
+            clone.pause();
+            clone.currentTime = 0;
+          } catch {}
+        }
+      }
+    })();
+    window.__akariSyncAnimations = function(seconds) {
+      const milliseconds = seconds * 1000;
+      for (const container of document.querySelectorAll('.akari-overlay-container')) {
+        for (const animation of container.getAnimations({ subtree: true })) {
+          try { animation.pause(); } catch {}
+          try { animation.currentTime = milliseconds; } catch {}
+        }
+      }
+    };
+    // HyperFrames never calls __akariSeek, so follow its transport clock instead. Only the
+    // HyperFrames runtime defines window.__player; the puppeteer-core and static-screenshot
+    // rasterizers never do, so for them the loop stays an idle poll for the life of the
+    // page. It must never give up waiting for the player: setup burns virtual-clock rAF
+    // ticks at an unpredictable rate, so any finite tick budget can die before the player
+    // appears (observed with a 600-tick cap).
+    (function() {
+      if (document.querySelectorAll('.akari-overlay-container').length === 0) return;
+      const hold = () => {
+        try {
+          const player = window.__player;
+          const seconds = player && typeof player.getTime === 'function'
+            ? Number(player.getTime())
+            : NaN;
+          if (Number.isFinite(seconds)) window.__akariSyncAnimations(seconds);
+        } catch {}
+        window.requestAnimationFrame(hold);
+      };
+      if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(hold);
+    })();
+    window.__akariSeek = async function(seconds) {${threeSeekCollector}
       for (const container of document.querySelectorAll('.akari-overlay-container')) {
         const start = Number(container.dataset.start);
         const duration = Number(container.dataset.duration);
         const active = seconds >= start && seconds < start + duration;
-        container.style.visibility = active ? 'visible' : 'hidden';
-        const localMilliseconds = Math.max(0, Math.min(duration, seconds - start)) * 1000;
-        for (const animation of container.getAnimations({ subtree: true })) {
-          animation.pause();
-          try { animation.currentTime = localMilliseconds; } catch {}
-        }${threeSeekBranch}
+        container.style.visibility = active ? 'visible' : 'hidden';${threeSeekBranch}
       }
+      window.__akariSyncAnimations(seconds);
       const videoSeekTimeoutMilliseconds = 5000;
       const waitForVideo = (video, index) => new Promise((resolve) => {
         let animationFrameOne = null;
@@ -123,17 +223,17 @@ ${nodes}
           videoSeekTimeoutMilliseconds,
         );
         try {
-          video.pause();
+          video.pause();${videoSeekTargetDeclaration}
           const alreadyAtTarget = !video.seeking
             && video.readyState >= 2
-            && Math.abs(video.currentTime - seconds) < 0.000001;
+            && Math.abs(video.currentTime - ${videoSeekTarget}) < 0.000001;
           if (alreadyAtTarget) {
             finish();
             return;
           }
           const usesVideoFrameCallback = typeof video.requestVideoFrameCallback === 'function';
           if (usesVideoFrameCallback) {
-            video.currentTime = seconds;
+            video.currentTime = ${videoSeekTarget};
             waitForPresentedVideoFrame();
           } else {
             seekedListener = () => {
@@ -141,7 +241,7 @@ ${nodes}
               waitForPresentedFrameWithAnimationFrames();
             };
             video.addEventListener('seeked', seekedListener, { once: true });
-            video.currentTime = seconds;
+            video.currentTime = ${videoSeekTarget};
           }
         } catch {
           finish();
@@ -149,7 +249,7 @@ ${nodes}
       });
       const warnings = (await Promise.all(
         Array.from(document.querySelectorAll('video'), waitForVideo),
-      )).filter(Boolean);
+      )).filter(Boolean);${threeDrawStep}
       await Promise.resolve();
       return { warnings };
     };${threeReadySetup}
@@ -639,6 +739,26 @@ function embedThreeModels(html, projectRoot, overlayId) {
         ...descriptor,
         model: `data:model/gltf-binary;base64,${model.toString("base64")}`,
       };
+      if (descriptor.environment?.map !== undefined) {
+        const map = descriptor.environment.map;
+        if (typeof map !== "string"
+          || map.length === 0
+          || map.startsWith("/")
+          || /^[a-z][a-z\d+.-]*:/i.test(map)) {
+          throw new TypeError(`3D overlay ${overlayId} environment.map must be a relative path`);
+        }
+        const mimeType = textureMimeType(map);
+        if (!mimeType.startsWith("image/")) {
+          throw new TypeError(
+            `3D overlay ${overlayId} environment.map must be an equirectangular image: ${map}`,
+          );
+        }
+        const image = readFileSync(resolve(projectRoot, map));
+        embeddedDescriptor.environment = {
+          ...descriptor.environment,
+          map: `data:${mimeType};base64,${image.toString("base64")}`,
+        };
+      }
       if (descriptor.materialOverrides !== undefined) {
         if (!descriptor.materialOverrides
           || typeof descriptor.materialOverrides !== "object"
@@ -662,6 +782,17 @@ function embedThreeModels(html, projectRoot, overlayId) {
             }
             const texture = readFileSync(resolve(projectRoot, override.texture));
             const mimeType = textureMimeType(override.texture);
+            if (mimeType.startsWith("video/") && texture.length > MAX_VIDEO_TEXTURE_BYTES) {
+              throw new Error(
+                `3D overlay ${overlayId} materialOverrides.${materialName}.texture is too large `
+                  + `(${Math.round(texture.length / 1024 / 1024)}MiB > ${MAX_VIDEO_TEXTURE_BYTES / 1024 / 1024}MiB): `
+                  + `${override.texture}\n`
+                  + "  Give the 720p editing proxy, not the master. The sheet embeds this as base64\n"
+                  + "  (~1.37x), and live preview seeks it on every tick.\n"
+                  + `  ffmpeg -i <master> -vf scale=-2:720 -c:v libx264 -crf 23 -preset medium `
+                  + "-pix_fmt yuv420p -an <proxy>.mp4",
+              );
+            }
             return [materialName, {
               texture: `data:${mimeType};base64,${texture.toString("base64")}`,
             }];

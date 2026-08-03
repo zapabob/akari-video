@@ -1,5 +1,5 @@
 {
-  "name": "akari-video",
+  "name": "akari-video-monorepo",
   "private": true,
   "license": "MIT",
   "workspaces": [
@@ -7,7 +7,11 @@
     "apps/*"
   ],
   "scripts": {
-    "gen:skills-index": "node scripts/gen-skills-index.mjs",
-    "check:skills-index": "node scripts/gen-skills-index.mjs --check"
+    "gen:skills-index": "node scripts/gen-skills-index.mjs --strict",
+    "check:skills-index": "node scripts/gen-skills-index.mjs --check --strict"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.0",
+    "js-yaml": "^4.3.0"
   }
 }

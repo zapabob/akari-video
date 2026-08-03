@@ -29,10 +29,18 @@ function collectLogs() {
 // 対象外。実 `~/.akari/` に触れず、実ネットワーク（実 GitHub）へも fetch しないよう、
 // AKARI_HOME を隔離した上でバックグラウンド fetch の起動自体を無効化する
 // （更新チェック自体の挙動は update-check.test.mjs / update-command.test.mjs が担当）。
+// isTTY: false は、実 TTY 端末でこのテストを実行した場合に creator-root 初回動線の
+// 対話プロンプト（first-run.mjs）が実 stdin を待って固まるのを防ぐための明示的な隔離
+// （creator-root 初回動線自体の挙動は creator-root-first-run.test.mjs が担当）。
 function isolatedUpdateOptions(root) {
   return {
     env: { ...process.env, AKARI_HOME: join(root, '.akari-home-unused') },
-    refreshUpdate: () => {}
+    refreshUpdate: () => {},
+    isTTY: false,
+    // 音源セットアップ（sounds-setup.mjs）も対象外として必ず殺す: --yes ケースは
+    // autoConfirm が TTY ゲートを迂回するため、放置すると実ダウンロード（395MB）が走る。
+    // 音源側の挙動は sounds-setup.test.mjs / cli-sounds.test.mjs が担当。
+    setupSounds: async () => ({ action: 'isolated-in-test' })
   };
 }
 
@@ -129,13 +137,14 @@ test('doctor 分岐: 既にセットアップ済みのフォルダでは scaffol
   });
 });
 
-test('claude 不在時の案内: PATH に claude が無い場合は案内を出し、claude を起動せずに終了する', async () => {
+test('claude 不在→opencode 不在: 両方無い場合は案内を出して終了する', async () => {
   await withScratchRoot(async (root) => {
     await mkdir(join(root, '.akari'), { recursive: true });
     await writeFile(join(root, '.akari', 'connections.json'), JSON.stringify({ providers: [], policy: {} }), 'utf8');
 
     const { log, lines } = collectLogs();
     let claudeSpawned = false;
+    let opencodeSpawned = false;
 
     const result = await run([], {
       projectRoot: root,
@@ -143,18 +152,48 @@ test('claude 不在時の案内: PATH に claude が無い場合は案内を出�
       assets: resolveRepoAssets(repoRoot),
       runDoctor: () => ({ status: 0 }),
       resolveClaude: () => null,
-      spawnClaude: () => {
-        claudeSpawned = true;
+      spawnClaude: () => { claudeSpawned = true; return { status: 0 }; },
+      resolveOpencode: () => null,
+      spawnOpencode: () => { opencodeSpawned = true; return { status: 0 }; },
+      ...isolatedUpdateOptions(root)
+    });
+
+    assert.equal(claudeSpawned, false);
+    assert.equal(opencodeSpawned, false);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.opencodeLaunched, false);
+    assert.ok(lines.some((line) => line.includes('claude コマンドが見つかりませんでした')));
+    assert.ok(lines.some((line) => line.includes('https://claude.ai/install.sh')));
+  });
+});
+
+test('claude 不在→opencode でフォールバック: opencode が見つかれば起動する', async () => {
+  await withScratchRoot(async (root) => {
+    await mkdir(join(root, '.akari'), { recursive: true });
+    await writeFile(join(root, '.akari', 'connections.json'), JSON.stringify({ providers: [], policy: {} }), 'utf8');
+
+    const { log, lines } = collectLogs();
+    let opencodeCall = null;
+
+    const result = await run([], {
+      projectRoot: root,
+      log,
+      assets: resolveRepoAssets(repoRoot),
+      runDoctor: () => ({ status: 0 }),
+      resolveClaude: () => null,
+      spawnClaude: () => { return { status: 0 }; },
+      resolveOpencode: () => '/fake/bin/opencode',
+      spawnOpencode: (opencodePath, args, cwd) => {
+        opencodeCall = { opencodePath, args, cwd };
         return { status: 0 };
       },
       ...isolatedUpdateOptions(root)
     });
 
-    assert.equal(claudeSpawned, false);
-    assert.equal(result.exitCode, 1);
-    assert.equal(result.claudeLaunched, false);
-    assert.ok(lines.some((line) => line.includes('claude コマンドが見つかりませんでした')));
-    assert.ok(lines.some((line) => line.includes('https://claude.ai/install.sh')));
+    assert.deepEqual(opencodeCall, { opencodePath: '/fake/bin/opencode', args: [], cwd: root });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.opencodeLaunched, true);
+    assert.ok(lines.some((line) => line.includes('Claude Code が見つかりません。opencode を起動します…')));
   });
 });
 
@@ -182,5 +221,116 @@ test('scaffold が例外を投げても claude 起動までは続行する（「
     assert.ok(lines.some((line) => line.includes('エラーが発生しました（続行します）')));
     assert.ok(claudeCall, 'scaffold が失敗しても claude 起動まで到達すること');
     assert.equal(result.exitCode, 7, 'claude の終了コードがそのまま伝播すること');
+  });
+});
+
+test('opencode モード: --opencode フラグで opencode を起動する', async () => {
+  await withScratchRoot(async (root) => {
+    await mkdir(join(root, '.akari'), { recursive: true });
+    await writeFile(join(root, '.akari', 'connections.json'), JSON.stringify({ providers: [], policy: {} }), 'utf8');
+
+    const { log, lines } = collectLogs();
+    let opencodeCall = null;
+
+    const result = await run(['--opencode', '--continue'], {
+      projectRoot: root,
+      log,
+      assets: resolveRepoAssets(repoRoot),
+      runDoctor: () => ({ status: 0 }),
+      resolveOpencode: () => '/fake/bin/opencode',
+      spawnOpencode: (opencodePath, args, cwd) => {
+        opencodeCall = { opencodePath, args, cwd };
+        return { status: 0 };
+      },
+      ...isolatedUpdateOptions(root)
+    });
+
+    assert.deepEqual(opencodeCall, { opencodePath: '/fake/bin/opencode', args: ['--continue'], cwd: root });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.opencodeLaunched, true);
+    assert.ok(lines.some((line) => line.includes('opencode を起動します…')));
+  });
+});
+
+test('opencode 不在時の案内: PATH に opencode が無い場合は案内を出し、opencode を起動せずに終了する', async () => {
+  await withScratchRoot(async (root) => {
+    await mkdir(join(root, '.akari'), { recursive: true });
+    await writeFile(join(root, '.akari', 'connections.json'), JSON.stringify({ providers: [], policy: {} }), 'utf8');
+
+    const { log, lines } = collectLogs();
+    let opencodeSpawned = false;
+
+    const result = await run(['--opencode'], {
+      projectRoot: root,
+      log,
+      assets: resolveRepoAssets(repoRoot),
+      runDoctor: () => ({ status: 0 }),
+      resolveOpencode: () => null,
+      spawnOpencode: () => {
+        opencodeSpawned = true;
+        return { status: 0 };
+      },
+      ...isolatedUpdateOptions(root)
+    });
+
+    assert.equal(opencodeSpawned, false);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.opencodeLaunched, false);
+    assert.ok(lines.some((line) => line.includes('opencode コマンドが見つかりませんでした')));
+    assert.ok(lines.some((line) => line.includes('npm install -g opencode')));
+  });
+});
+
+test('--yes: Claude Code に --permission-mode acceptEdits を付加する', async () => {
+  await withScratchRoot(async (root) => {
+    await mkdir(join(root, '.akari'), { recursive: true });
+    await writeFile(join(root, '.akari', 'connections.json'), JSON.stringify({ providers: [], policy: {} }), 'utf8');
+
+    const { log, lines } = collectLogs();
+    let claudeCall = null;
+
+    const result = await run(['--yes', '--continue'], {
+      projectRoot: root,
+      log,
+      assets: resolveRepoAssets(repoRoot),
+      runDoctor: () => ({ status: 0 }),
+      resolveClaude: () => '/fake/bin/claude',
+      spawnClaude: (claudePath, args, cwd) => {
+        claudeCall = { claudePath, args, cwd };
+        return { status: 0 };
+      },
+      ...isolatedUpdateOptions(root)
+    });
+
+    assert.deepEqual(claudeCall, { claudePath: '/fake/bin/claude', args: ['--permission-mode', 'acceptEdits', '--continue'], cwd: root });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.claudeLaunched, true);
+  });
+});
+
+test('--yes: opencode に --auto を付加する', async () => {
+  await withScratchRoot(async (root) => {
+    await mkdir(join(root, '.akari'), { recursive: true });
+    await writeFile(join(root, '.akari', 'connections.json'), JSON.stringify({ providers: [], policy: {} }), 'utf8');
+
+    const { log, lines } = collectLogs();
+    let opencodeCall = null;
+
+    const result = await run(['-y', '--opencode', '--continue'], {
+      projectRoot: root,
+      log,
+      assets: resolveRepoAssets(repoRoot),
+      runDoctor: () => ({ status: 0 }),
+      resolveOpencode: () => '/fake/bin/opencode',
+      spawnOpencode: (opencodePath, args, cwd) => {
+        opencodeCall = { opencodePath, args, cwd };
+        return { status: 0 };
+      },
+      ...isolatedUpdateOptions(root)
+    });
+
+    assert.deepEqual(opencodeCall, { opencodePath: '/fake/bin/opencode', args: ['--auto', '--continue'], cwd: root });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.opencodeLaunched, true);
   });
 });

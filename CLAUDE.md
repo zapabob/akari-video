@@ -12,15 +12,16 @@
 | `apps/shell/` | Theia ベースのシェル本体（タブ + ツリー + 右パートナー + 4 アイコン） |
 | `packages/` | シェル非依存ライブラリ（schemas / preview-engine / サーフェスランタイム / decision-cards） |
 | `skills/` | ステージスキル（調査・企画・編集・QA。ステージはアプリ機能にしない） |
-| `templates/` | プロジェクト雛形（英語正準: assets/ planning/ exports/ + CLAUDE.md + AGENTS.md + .akari/ + .claude/） |
+| `templates/` | プロジェクトの出発点（`templates/INDEX.md`）。**器**（`project-default/` — assets/ planning/ exports/ + CLAUDE.md + AGENTS.md + .akari/ + .claude/。コードとスキルが参照する製品の一部）と**作例**（`kaisetsu-short/` — 人が複製して改造する完成フロー）の 2 種 |
 | `catalog/` | 🧩 キュレーションカタログ定義（**参照配布のみ** — メタデータ・ツマミ宣言・プレビュー。実体バイナリは置かない） |
+| `presets/` | コードが id で引く参照表（テロップテンプレ・LUT）。素材ライブラリ契約の対象外（`presets/INDEX.md`） |
 | `docs/` | 設計文書（シェル非依存のものを internal / legacy から選別移送） |
 
 ## 設計の不変条件（正本は internal の契約群）
 
 - **ファイル契約が結合の全て**: アプリ⇄エージェント間に IPC を置かない。
   タブ = ファイル + サイドカー、応答 = decisions.json / review.json / git diff の 3 チャネル
-- **ハーネス非依存**: エージェント統合は PTY + ファイル契約。Claude Code / Codex どちらでも動く
+- **ハーネス非依存**: エージェント統合は PTY + ファイル契約。opencode / Claude Code どちらでも動く
 - **ステージを実装しない**: ステージ = スキル + サーフェス規約。アプリは汎用基盤 4 点のみ
   - 適用注記（2026-07-25 オーナー裁定）: **宣言済み入力で走る決定論的 CLI
     （edit-lint / render-cut 等）の直接実行と進捗表示は汎用基盤に含む**。

@@ -1,10 +1,41 @@
 #!/usr/bin/env node
 // AGENTS.md のスキル索引を skills/*/SKILL.md の frontmatter (name / description) から再生成する。
 // マーカーコメント間だけを書き換える。--check は再生成結果と現状の diff が出たら exit 1（CI 用）。
-// あわせて .claude/skills / .agents/skills の symlink が skills/ と 1:1 で解決することも検査する。
+// あわせて .claude/skills / .agents/skills / .cursor/skills / .codex/skills / .opencode/skills の symlink が
+// skills/ と 1:1 で解決することも検査する。
 import { readFileSync, writeFileSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// ci.yml / windows-build.yml / release.yml はこのスクリプトを npm install より前に
+// 依存ゼロで実行する（Windows レーンの主目的は symlink 実体化チェック）。そのため
+// js-yaml は動的 import とし、不在時は下の最小 YAML サブセット解釈へフォールバックする。
+// ただしフォールバックは厳密判定（issue #4 の再発ゲート）を黙って無効化するため、
+// 厳密検証を期待する呼び出し（ci.yml の skills-index ジョブ / npm scripts）は --strict を
+// 付けて js-yaml 不在を exit 1 にする（issue #4 別件指摘）。install 前の symlink
+// 早期ゲート（windows-build.yml / release.yml）だけが --strict なしのフォールバック許容。
+let yamlLoad = null;
+try {
+  yamlLoad = (await import('js-yaml')).default.load;
+} catch {
+  if (process.argv.includes('--strict')) {
+    console.error('gen-skills-index: js-yaml 不在 — --strict のため失敗にします。npm install で root devDependencies を入れてから再実行してください');
+    process.exit(1);
+  }
+  console.error('gen-skills-index: js-yaml 不在 — 最小フォールバックで frontmatter を解釈します（厳密 YAML 検証はスキップ）');
+}
+
+// YAML の flow scalar の最小解釈: 前後の引用符を除去（double quote は JSON 互換の
+// エスケープ、single quote は '' → '）。現行 SKILL.md 群では js-yaml と同一の値になる。
+const unquoteScalar = (value) => {
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    try { return JSON.parse(value); } catch { return value.slice(1, -1); }
+  }
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1).replace(/''/g, "'");
+  }
+  return value;
+};
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BEGIN = '<!-- BEGIN GENERATED skills-index — scripts/gen-skills-index.mjs が生成。手で編集しない -->';
@@ -22,17 +53,29 @@ const skills = skillNames.map((name) => {
   const path = join(root, 'skills', name, 'SKILL.md');
   const m = readFileSync(path, 'utf8').match(/^---\n([\s\S]*?)\n---/);
   if (!m) fail(`frontmatter がない: skills/${name}/SKILL.md`);
-  const fm = {};
-  for (const line of m[1].split('\n')) {
-    const kv = line.match(/^([\w-]+):\s*(.*)$/);
-    if (kv) fm[kv[1]] = kv[2].trim();
+  // 行正規表現ではなく YAML として parse する。Claude Code 実行時と同じ判定にしないと、
+  // 不正 YAML（例: 引用符なし値中の「: 」）が索引生成を素通りして実行時だけ落ちる（issue #4）
+  let fm;
+  if (yamlLoad) {
+    try {
+      fm = yamlLoad(m[1]);
+    } catch (e) {
+      fail(`frontmatter が YAML として parse できない: skills/${name}/SKILL.md — ${e.message.split('\n')[0]}`);
+    }
+    if (typeof fm !== 'object' || fm === null) fail(`frontmatter が mapping でない: skills/${name}/SKILL.md`);
+  } else {
+    fm = {};
+    for (const line of m[1].split('\n')) {
+      const kv = line.match(/^([\w-]+):\s*(.*)$/);
+      if (kv) fm[kv[1]] = unquoteScalar(kv[2].trim());
+    }
   }
   if (!fm.name || !fm.description) fail(`name / description が欠落: skills/${name}/SKILL.md`);
   if (fm.name !== name) fail(`frontmatter name とディレクトリ名が不一致: ${fm.name} != ${name}`);
   return fm;
 });
 
-for (const adapter of ['.claude/skills', '.agents/skills', '.codex/skills']) {
+for (const adapter of ['.claude/skills', '.agents/skills', '.cursor/skills', '.codex/skills', '.opencode/skills']) {
   for (const name of skillNames) {
     const link = join(root, adapter, name);
     let target;
